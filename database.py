@@ -3,6 +3,7 @@ import random
 from datetime import datetime, timezone
 from pymongo import MongoClient
 from dotenv import load_dotenv
+import streamlit as st
 
 try:
     import certifi
@@ -12,9 +13,11 @@ except ImportError:
 
 load_dotenv()
 
-MONGO_URI = os.getenv("MONGO_URI")
+
+MONGO_URI = os.getenv("MONGO_URI") or st.secrets.get("MONGO_URI")
 if not MONGO_URI:
-    raise ValueError("MONGO_URI is missing. Check your .env file.")
+    raise ValueError("MONGO_URI is missing. Check your .env file or Streamlit Secrets.")
+
 
 client_kwargs = {"tlsCAFile": CA_FILE} if CA_FILE else {}
 client = MongoClient(MONGO_URI, **client_kwargs)
