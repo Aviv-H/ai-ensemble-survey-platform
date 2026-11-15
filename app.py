@@ -1,82 +1,130 @@
 import streamlit as st
 import altair as alt
 import pandas as pd
-import random
 import time
 import uuid
-import database_old
+import database
 
 # ==========================================
-# 1. הגדרות עמוד (עכשיו מוגדר כרחב - Wide)
+# 1. הגדרות עמוד וקבועי ניסוי
 # ==========================================
-st.set_page_config(page_title="AI Decision Making Study", page_icon="🤖", layout="wide")
+st.set_page_config(page_title="AI Forecasting Study", page_icon="📊", layout="wide")
+
+NUM_TRIALS = 10      # מספר ה-trials למשתתף (ניתן להגדרה: 10 = 2 מכל משפחת תמיכה)
+MIN_WAIT_TIME = 8    # זמן המתנה מינימלי בשניות בכל מסך משימה
+
+# הסתרת אלמנט ה-Honeypot מעין אנושית (שמירה על נגישות וזיהוי סוכנים אוטומטיים ב-DOM)
+st.markdown(
+    """
+    <style>
+    div[data-testid="stTextInput"]:has(input[aria-label="system_verification_token_field"]) {
+        position: absolute !important;
+        left: -9999px !important;
+        width: 1px !important;
+        height: 1px !important;
+        overflow: hidden !important;
+        opacity: 0 !important;
+        pointer-events: none !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# הגדרות 5 פריטי הדירוג (ממופים בדיוק לשמות העמודות ב-DB)
+RATING_CONFIG = {
+    "score_satisfaction": {
+        "label": "Satisfaction with the presented output",
+        "prompt": "How satisfied are you with the way this prediction was presented?",
+        "low": "1 = Completely dissatisfied",
+        "high": "7 = Completely satisfied",
+    },
+    "score_trust": {
+        "label": "Trust in the system's prediction",
+        "prompt": "How much do you trust the system's selected prediction on this item?",
+        "low": "1 = Do not trust at all",
+        "high": "7 = Trust completely",
+    },
+    "score_uncertainty": {
+        "label": "Perceived certainty of the prediction",
+        "prompt": "How certain does this prediction appear based on the information shown?",
+        "low": "1 = Extremely uncertain",
+        "high": "7 = Completely certain",
+    },
+    "score_understanding": {
+        "label": "Understanding of the selection",
+        "prompt": "How well do you understand why the system selected this option over the others?",
+        "low": "1 = Do not understand at all",
+        "high": "7 = Understand completely",
+    },
+    "score_cognitive_load": {
+        "label": "Mental effort required",
+        "prompt": "How mentally demanding was it to understand the information shown?",
+        "low": "1 = Not demanding at all",
+        "high": "7 = Extremely demanding",
+    },
+}
+
 
 # ==========================================
-# 2. ניהול מצב (Session State)
+# 2. ניהול מצב (Session State) וטעינת מאגרים
 # ==========================================
-if 'stage' not in st.session_state:
-    st.session_state.stage = 'intro'  # intro, resume_prompt, task, feedback, outro
+if "stage" not in st.session_state:
+    st.session_state.stage = "intro"  # intro, resume_prompt, task, comprehension, feedback, outro
 
-if 'participant_id' not in st.session_state:
-    pid = st.query_params.get("PROLIFIC_PID", "")
-    st.session_state.participant_id = pid
+url_pid = st.query_params.get("PROLIFIC_PID", "").strip()
+if "participant_id" not in st.session_state:
+    st.session_state.participant_id = url_pid
 
-if 'questions' not in st.session_state:
+if "questions_map" not in st.session_state or "distributions_map" not in st.session_state:
     try:
-        all_q = database.get_all_questions()
-        random.shuffle(all_q)
-        st.session_state.questions = all_q
+        st.session_state.questions_map = database.get_questions_map()
+        st.session_state.distributions_map = database.get_distributions_map()
     except Exception as e:
-        st.error("Could not connect to the database. Please check your credentials.")
+        st.error(f"Could not connect to the database: {e}")
         st.stop()
 
-if 'current_q_index' not in st.session_state:
+if "participant_doc" not in st.session_state:
+    st.session_state.participant_doc = None
+
+if "current_q_index" not in st.session_state:
     st.session_state.current_q_index = 0
 
-if 'current_format' not in st.session_state:
-    st.session_state.current_format = random.choice([1, 2, 3])
+if "start_time" not in st.session_state:
+    st.session_state.start_time = 0.0
 
-if 'start_time' not in st.session_state:
-    st.session_state.start_time = 0
-
-if 'completion_code' not in st.session_state:
+if "completion_code" not in st.session_state:
     st.session_state.completion_code = None
-
-if 'feedback' not in st.session_state:
-    st.session_state.feedback = ""
-
-# --- זמן המתנה חובה בכל מסך (בשניות) ---
-MIN_WAIT_TIME = 8
 
 
 # ==========================================
 # 3. פונקציות עזר
 # ==========================================
-def submit_response(satisfaction, trust, uncertainty, understanding, cog_load):
-    response_time = int((time.time() - st.session_state.start_time) * 1000)
-    current_q = st.session_state.questions[st.session_state.current_q_index]
+def submit_trial(ratings_dict, honeypot_value):
+    response_time_ms = int((time.time() - st.session_state.start_time) * 1000)
+    p_doc = st.session_state.participant_doc
+    trial = p_doc["assigned_trials"][st.session_state.current_q_index]
+    q_doc = st.session_state.questions_map[trial["question_id"]]
+    d_doc = st.session_state.distributions_map[trial["distribution_id"]]
 
-    response_data = {
-        "participant_id": st.session_state.participant_id,
-        "question_id": current_q["_id"],
-        "distribution_id": current_q["assigned_distribution_id"],
-        "presentation_format": st.session_state.current_format,
-        "order_index": st.session_state.current_q_index + 1,
-        "response_time_ms": response_time,
-        "score_satisfaction": satisfaction,
-        "score_trust": trust,
-        "score_uncertainty": uncertainty,
-        "score_understanding": understanding,
-        "score_cognitive_load": cog_load
-    }
+    honeypot_triggered = bool(honeypot_value and honeypot_value.strip() != "")
 
-    database.save_response(response_data)
-    st.session_state.current_q_index += 25
+    database.save_response(
+        participant_doc=p_doc,
+        trial_assignment=trial,
+        question_doc=q_doc,
+        distribution_doc=d_doc,
+        ratings=ratings_dict,
+        response_time_ms=response_time_ms,
+        honeypot_triggered=honeypot_triggered,
+        comprehension_check_passed=None,
+    )
 
-    if st.session_state.current_q_index >= len(st.session_state.questions):
-        st.session_state.stage = 'feedback'
+    st.session_state.current_q_index += 1
+
+    if st.session_state.current_q_index >= len(p_doc["assigned_trials"]):
+        st.session_state.stage = "comprehension"
     else:
-        st.session_state.current_format = random.choice([1, 2, 3])
         st.session_state.start_time = time.time()
 
 
@@ -85,168 +133,223 @@ def submit_response(satisfaction, trust, uncertainty, understanding, cog_load):
 # ==========================================
 
 # --- מסך פתיחה ---
-if st.session_state.stage == 'intro':
+if st.session_state.stage == "intro":
     _, col_center, _ = st.columns([1, 2, 1])
     with col_center:
-        st.title("Welcome to the AI Prediction Study 🤖")
-        st.write("""
-        Thank you for participating in this research. 
-        In this study, an advanced AI system has analyzed various industrial and market trends. 
-        You will be presented with 40 questions and the AI's prediction for each.
-        After reviewing the AI's output, you will be asked to rate your experience.
-        """)
+        st.title("Welcome to the Forecasting Evaluation Study")
+        st.write(
+            f"""
+            Thank you for taking part in this study. 
+            Previously, an automated forecasting system evaluated sets of four possible outcomes across various industrial and market topics and selected one forecast for each question.
 
-        pid_input = st.text_input("Please enter your Prolific ID:", value=st.session_state.participant_id)
+            You will review **{NUM_TRIALS} questions**, see the four possible alternatives along with the system's selected forecast, and answer five short rating questions on each screen.
+            Please note that each screen requires at least **{MIN_WAIT_TIME} seconds** before you can submit your ratings.
+            """
+        )
 
-        if st.button("I Consent - Start Study", use_container_width=True):
+        if url_pid:
+            st.text_input("Prolific Participant ID:", value=url_pid, disabled=True)
+            pid_input = url_pid
+        else:
+            pid_input = st.text_input(
+                "Participant ID (Prolific ID or Tester Name):",
+                value=st.session_state.participant_id,
+            )
+
+        if st.button("I Consent — Start Study", use_container_width=True):
             if pid_input.strip() == "":
-                st.error("Please enter your Prolific ID to proceed.")
+                st.error("Please enter your Participant ID to proceed.")
             else:
                 pid = pid_input.strip()
                 st.session_state.participant_id = pid
-                existing_participant = database.get_participant(pid)
+                existing = database.get_participant(pid)
 
-                if existing_participant and existing_participant.get("status") == "COMPLETED":
-                    st.session_state.completion_code = existing_participant.get("completion_code")
-                    st.session_state.stage = 'outro'
+                if existing and existing.get("status") == "COMPLETED":
+                    st.session_state.participant_doc = existing
+                    st.session_state.completion_code = existing.get("completion_code")
+                    st.session_state.stage = "outro"
                     st.rerun()
-                elif existing_participant and existing_participant.get("status") == "IN_PROGRESS":
+                elif existing and existing.get("status") == "IN_PROGRESS":
+                    st.session_state.participant_doc = existing
                     completed_count = database.get_participant_responses_count(pid)
-                    if completed_count > 0:
-                        st.session_state.stage = 'resume_prompt'
+                    total_assigned = len(existing.get("assigned_trials", []))
+                    if completed_count >= total_assigned and total_assigned > 0:
+                        st.session_state.stage = "comprehension"
+                        st.rerun()
+                    elif completed_count > 0:
+                        st.session_state.stage = "resume_prompt"
                         st.rerun()
                     else:
                         st.session_state.current_q_index = 0
                         st.session_state.start_time = time.time()
-                        st.session_state.stage = 'task'
+                        st.session_state.stage = "task"
                         st.rerun()
                 else:
-                    database.create_or_get_participant(pid, user_agent="Streamlit App")
+                    p_doc = database.create_or_get_participant(
+                        pid, user_agent="Streamlit App", num_trials=NUM_TRIALS
+                    )
+                    st.session_state.participant_doc = p_doc
                     st.session_state.current_q_index = 0
                     st.session_state.start_time = time.time()
-                    st.session_state.stage = 'task'
+                    st.session_state.stage = "task"
                     st.rerun()
 
-# --- מסך שאלת המשך ---
-elif st.session_state.stage == 'resume_prompt':
+# --- מסך המשך / התחלה מחדש ---
+elif st.session_state.stage == "resume_prompt":
     _, col_center, _ = st.columns([1, 2, 1])
     with col_center:
         pid = st.session_state.participant_id
+        p_doc = st.session_state.participant_doc
         completed_count = database.get_participant_responses_count(pid)
-        total_q = len(st.session_state.questions)
+        total_q = len(p_doc["assigned_trials"])
 
         st.info("### Welcome Back!")
-        st.write(f"We noticed that you have already answered **{completed_count} out of {total_q}** questions.")
-        st.write("Would you like to resume where you left off, or start over from the beginning?")
+        st.write(f"You have already completed **{completed_count} of {total_q}** questions.")
+        st.write("Would you like to resume where you left off or start over from the beginning?")
 
         col1, col2 = st.columns(2)
         with col1:
-            if st.button("▶️ Resume Where I Left Off", use_container_width=True):
+            if st.button("Resume Where I Left Off", use_container_width=True):
                 st.session_state.current_q_index = completed_count
                 st.session_state.start_time = time.time()
-                st.session_state.stage = 'task'
+                st.session_state.stage = "task"
                 st.rerun()
         with col2:
-            if st.button("🔄 Start Over", use_container_width=True):
-                database.reset_participant_responses(pid)
+            if st.button("Start Over", use_container_width=True):
+                st.session_state.participant_doc = database.reset_participant_responses(
+                    pid, num_trials=NUM_TRIALS
+                )
                 st.session_state.current_q_index = 0
                 st.session_state.start_time = time.time()
-                st.session_state.stage = 'task'
+                st.session_state.stage = "task"
                 st.rerun()
 
 # --- מסך המשימה (Side by Side) ---
-elif st.session_state.stage == 'task':
-    total_q = len(st.session_state.questions)
-    current_q_num = st.session_state.current_q_index + 1
+elif st.session_state.stage == "task":
+    p_doc = st.session_state.participant_doc
+    assigned_trials = p_doc["assigned_trials"]
+    total_q = len(assigned_trials)
+    idx = st.session_state.current_q_index
+    current_q_num = idx + 1
 
     st.progress(current_q_num / total_q, text=f"Question {current_q_num} of {total_q}")
     st.write("")
 
+    trial = assigned_trials[idx]
+    q_data = st.session_state.questions_map[trial["question_id"]]
+    dist_data = st.session_state.distributions_map[trial["distribution_id"]]
+
+    # סידור האפשרויות והתמיכה לפי הפרמוטציה שהוגרלה ל-Trial זה
+    perm = trial["option_permutation"]
+    winner_pos = trial["winner_position"]
+    realized_options = [q_data["options"][i]["text"] for i in perm]
+    realized_counts = [dist_data["support_counts"][i] for i in perm]
+
+    total_support = sum(realized_counts)
+    realized_percentages = [round((v / total_support) * 100) for v in realized_counts]
+
+    selected_opt_label = f"Option {chr(65 + winner_pos)}"
+    selected_opt_text = realized_options[winner_pos]
+    winning_perc = realized_percentages[winner_pos]
+
+    fmt = p_doc["condition_assigned"]  # Between-Subjects קבוע למשתתף
+
     col_left, col_right = st.columns([1.2, 1], gap="large")
 
-    q_data = st.session_state.questions[st.session_state.current_q_index]
-    dist_data = database.get_distribution(q_data['assigned_distribution_id'])
-    options = q_data['options']
-
-    # ==== עמודה שמאלית: השאלה ופלט ה-AI ====
+    # ==== עמודה שמאלית: השאלה, כל האופציות, ופלט התמיכה ====
     with col_left:
         st.subheader(f"Domain: {q_data['domain_id'].replace('_', ' ').title()}")
         st.markdown(f"**{q_data['question_text']}**")
 
+        st.write("**Alternatives:**")
+        for i in range(4):
+            opt_letter = f"Option {chr(65 + i)}"
+            opt_text = realized_options[i]
+            if i == winner_pos:
+                st.markdown(f"- **{opt_letter}: {opt_text}** *(Selected)*")
+            else:
+                st.markdown(f"- {opt_letter}: {opt_text}")
+
         st.divider()
-        st.write("### AI System Output:")
-
-        total_votes = sum(dist_data['support_counts'])
-        percentages = [round((v / total_votes) * 100) for v in dist_data['support_counts']]
-
-        selected_opt = options[q_data['selected_option_index']]['text']
-        winning_perc = percentages[0]
-
-        fmt = st.session_state.current_format
+        st.write("### System Output")
 
         if fmt == 1:
-            st.info(f"**The system predicts:** {selected_opt}")
+            st.info(f"**Selected option:** **{selected_opt_label} — {selected_opt_text}**")
 
         elif fmt == 2:
             st.info(
-                f"**The system predicts:** {selected_opt}\n\n*(Supported by {winning_perc}% internal system consensus)*")
+                f"**Selected option:** **{selected_opt_label} — {selected_opt_text}**\n\n"
+                f"Support for the selected option: **{winning_perc}%**."
+            )
 
         elif fmt == 3:
-            st.info(f"**The system predicts:** {selected_opt}")
-            st.write("**Internal Consensus Distribution:**")
+            st.info(f"**Selected option:** **{selected_opt_label} — {selected_opt_text}**")
+            st.write("**Support distribution:**")
 
             df_chart = pd.DataFrame({
-                'Option_Label': [f"Option {chr(65 + i)}" for i in range(4)],
-                'Percentage': percentages,
-                'Perc_Text': [f"{p}%" for p in percentages]
+                "Option_Label": [f"Option {chr(65 + i)}" for i in range(4)],
+                "Percentage": realized_percentages,
+                "Perc_Text": [f"{p}%" for p in realized_percentages],
             })
 
-            bars = alt.Chart(df_chart).mark_bar(
-                cornerRadiusTopLeft=4, cornerRadiusTopRight=4, color="#1f77b4"
-            ).encode(
-                x=alt.X('Option_Label:N', title=None, axis=alt.Axis(labelAngle=0, labelFontSize=12)),
-                y=alt.Y('Percentage:Q', title="Consensus (%)", scale=alt.Scale(domain=[0, 100]),
-                        axis=alt.Axis(grid=False)),
-                tooltip=['Option_Label', 'Perc_Text']
+            bars = (
+                alt.Chart(df_chart)
+                .mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4, color="#2b5c8f")
+                .encode(
+                    x=alt.X(
+                        "Option_Label:N",
+                        title=None,
+                        axis=alt.Axis(labelAngle=0, labelFontSize=12),
+                    ),
+                    y=alt.Y(
+                        "Percentage:Q",
+                        title="Support (%)",
+                        scale=alt.Scale(domain=[0, 105]),
+                        axis=alt.Axis(grid=False),
+                    ),
+                    tooltip=["Option_Label", "Perc_Text"],
+                )
             )
 
             text = bars.mark_text(
-                align='center', baseline='bottom', dy=-5, fontSize=13, fontWeight='bold'
-            ).encode(text='Perc_Text:N')
+                align="center",
+                baseline="bottom",
+                dy=-5,
+                fontSize=13,
+                fontWeight="bold",
+                color="#111111",
+            ).encode(text="Perc_Text:N")
 
-            st.altair_chart((bars + text).properties(height=200), use_container_width=True)
+            st.altair_chart((bars + text).properties(height=220), use_container_width=True)
 
-            st.write("**Options:**")
-            for i in range(4):
-                st.markdown(f"- **Option {chr(65 + i)}:** {options[i]['text']}")
-
-    # ==== עמודה ימנית: השאלון המעוצב ====
+    # ==== עמודה ימנית: שאלון ההערכה בסדר שהוגרל ====
     with col_right:
-        with st.form(key=f"form_{current_q_num}"):
+        with st.form(key=f"form_trial_{current_q_num}"):
             st.write("### Your Evaluation")
-            st.write("Please evaluate the AI response (Select a number from 1 to 7):")
+            st.write("Please rate the system's output on each scale from 1 to 7:")
 
             scale_options = [1, 2, 3, 4, 5, 6, 7]
+            ratings_input = {}
 
-            st.markdown("**1. Satisfaction with the answer format:**")
-            st.caption("👈 1 = Completely Dissatisfied | 7 = Extremely Satisfied 👉")
-            q_sat = st.segmented_control("Satisfaction", scale_options, default=None, label_visibility="collapsed")
+            for item_num, rating_key in enumerate(trial["rating_items_order"], start=1):
+                cfg = RATING_CONFIG[rating_key]
+                st.markdown(f"**{item_num}. {cfg['label']}** — {cfg['prompt']}")
+                st.caption(f"{cfg['low']}  |  {cfg['high']}")
+                ratings_input[rating_key] = st.segmented_control(
+                    label=rating_key,
+                    options=scale_options,
+                    default=None,
+                    label_visibility="collapsed",
+                    key=f"seg_{current_q_num}_{rating_key}",
+                )
 
-            st.markdown("**2. Perceived Trust & Professionalism:**")
-            st.caption("👈 1 = Completely Unreliable | 7 = Highly Professional & Reliable 👉")
-            q_trust = st.segmented_control("Trust", scale_options, default=None, label_visibility="collapsed")
-
-            st.markdown("**3. Perceived Certainty of the AI:**")
-            st.caption("👈 1 = Extremely Uncertain | 7 = Totally Confident 👉")
-            q_unc = st.segmented_control("Certainty", scale_options, default=None, label_visibility="collapsed")
-
-            st.markdown("**4. Understanding of AI's reasoning:**")
-            st.caption("👈 1 = Completely Unclear | 7 = Perfectly Clear 👉")
-            q_und = st.segmented_control("Understanding", scale_options, default=None, label_visibility="collapsed")
-
-            st.markdown("**5. Cognitive Load:**")
-            st.caption("👈 1 = Very Easy to Process | 7 = Extremely Heavy & Confusing 👉")
-            q_cog = st.segmented_control("Cognitive Load", scale_options, default=None, label_visibility="collapsed")
+            # מלכודת DOM מוסתרת עבור סוכנים אוטומטיים (Honeypot signal)
+            honeypot_val = st.text_input(
+                "system_verification_token_field",
+                value="",
+                key=f"hp_{current_q_num}",
+                help="Ignore this field if you are human.",
+            )
 
             submit_btn = st.form_submit_button("Submit & Next Question", use_container_width=True)
 
@@ -254,47 +357,86 @@ elif st.session_state.stage == 'task':
                 elapsed = time.time() - st.session_state.start_time
                 if elapsed < MIN_WAIT_TIME:
                     st.error(
-                        f"Please take at least {MIN_WAIT_TIME} seconds to review the information carefully before proceeding.")
-                elif None in [q_sat, q_trust, q_unc, q_und, q_cog]:
-                    st.error("⚠️ Please answer all 5 questions by selecting a number before proceeding.")
+                        f"Please take at least {MIN_WAIT_TIME} seconds to review the question and output before submitting."
+                    )
+                elif any(v is None for v in ratings_input.values()):
+                    st.error("Please select a rating (1–7) for all 5 items before proceeding.")
                 else:
-                    submit_response(q_sat, q_trust, q_unc, q_und, q_cog)
+                    submit_trial(ratings_input, honeypot_val)
                     st.rerun()
 
-# --- מסך חוות דעת (Feedback) ---
-elif st.session_state.stage == 'feedback':
+# --- מסך בדיקת הבנה גלויה (Visible Comprehension Check) ---
+elif st.session_state.stage == "comprehension":
     _, col_center, _ = st.columns([1, 2, 1])
     with col_center:
-        st.title("Almost Done! 📝")
-        st.write("Before we finish, please share your thoughts regarding the study.")
-        st.write(
-            "How did you feel about the AI's predictions and the way the information was presented? Did you notice anything specific?")
+        st.title("Quick Check")
+        st.write("Before completing the study, please answer one brief question about the information displayed during the tasks.")
 
-        feedback_input = st.text_area("Your Feedback:", height=150, placeholder="Type your thoughts here...")
+        fmt = st.session_state.participant_doc["condition_assigned"]
+
+        if fmt == 1:
+            q_check_text = "Which statement best describes what the system showed you in each task?"
+            options_check = [
+                "A single selected option from four alternatives, without support percentages.",
+                "A guaranteed real-time calculation showing exact probabilities for 2026.",
+                "Only two options per question, chosen at random.",
+            ]
+            correct_answer = options_check[0]
+        else:
+            q_check_text = (
+                "Suppose the system displays 'Support for the selected option: 52%' (or 52% in a support distribution). "
+                "Does this mean there is a 52% verified probability that the prediction will turn out to be correct?"
+            )
+            options_check = [
+                "No — it reflects the share of support across the alternatives, not a verified probability of future accuracy.",
+                "Yes — it means the forecast has been statistically proven to have a 52% chance of occurring.",
+                "Yes — it means 52 human experts voted on the question live during the session.",
+            ]
+            correct_answer = options_check[0]
+
+        user_choice = st.radio(q_check_text, options_check, index=None)
+
+        if st.button("Continue", use_container_width=True):
+            if user_choice is None:
+                st.error("Please select an answer to continue.")
+            else:
+                passed = user_choice == correct_answer
+                database.update_comprehension_check(st.session_state.participant_id, passed)
+                st.session_state.stage = "feedback"
+                st.rerun()
+
+# --- מסך חוות דעת (Feedback) ---
+elif st.session_state.stage == "feedback":
+    _, col_center, _ = st.columns([1, 2, 1])
+    with col_center:
+        st.title("Almost Done!")
+        st.write("Before finishing, please share your brief thoughts on the study.")
+        st.write(
+            "How did you interpret the system's output and the way the information was presented? "
+            "Was anything unclear or confusing?"
+        )
+
+        feedback_input = st.text_area("Your Comments:", height=140, placeholder="Type your response here...")
 
         if st.button("Submit & Finish Study", use_container_width=True):
             if len(feedback_input.strip()) < 5:
-                st.error("Please provide at least a brief feedback to complete the study.")
+                st.error("Please enter a brief response (at least 5 characters) to complete the study.")
             else:
-                st.session_state.feedback = feedback_input.strip()
-                st.session_state.stage = 'outro'
+                code = str(uuid.uuid4())[:8].upper()
+                st.session_state.completion_code = code
+                database.update_participant_completed(
+                    st.session_state.participant_id,
+                    code,
+                    feedback_input.strip(),
+                )
+                st.session_state.stage = "outro"
                 st.rerun()
 
 # --- מסך סיום (Outro) ---
-elif st.session_state.stage == 'outro':
+elif st.session_state.stage == "outro":
     _, col_center, _ = st.columns([1, 2, 1])
     with col_center:
-        st.success("🎉 You have completed the study!")
-
-        if not st.session_state.completion_code:
-            code = str(uuid.uuid4())[:8].upper()
-            st.session_state.completion_code = code
-            database.update_participant_completed(
-                st.session_state.participant_id,
-                code,
-                st.session_state.feedback
-            )
-
-        st.write("Please copy the completion code below and paste it back in Prolific to receive your payment:")
+        st.success("You have completed the study!")
+        st.write("Please copy the completion code below and paste it into Prolific:")
         st.code(st.session_state.completion_code, language="text")
         st.write("Thank you for your participation!")
